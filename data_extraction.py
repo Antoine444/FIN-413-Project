@@ -482,7 +482,7 @@ def extract_slot0_snapshots() -> pd.DataFrame:
 # =============================================================================
     
 def extract_swap_events() -> pd.DataFrame:
-	"""
+    """
     Fetch every Swap event emitted by the pool during the study window.
 
     The Swap event encodes:
@@ -498,13 +498,13 @@ def extract_swap_events() -> pd.DataFrame:
     """
     
     print("\n=== Output 1: swap_events ===")
-
+    
     logs = get_logs_cached(pool.events.Swap(), STUDY_START_BLOCK, STUDY_END_BLOCK)
     print(f"  Fetched {len(logs):,} Swap events")
-
+    
     block_nums = [log["blockNumber"] for log in logs]
     timestamps = fetch_block_timestamps(block_nums)
-
+    
     # Identify any blocks that are still missing from the cache
     missing_blocks = list(set(block_nums) - set(timestamps.keys()))
     if missing_blocks:
@@ -513,7 +513,7 @@ def extract_swap_events() -> pd.DataFrame:
             block = retry_call(w3.eth.get_block, bn)
             timestamps[bn] = datetime.fromtimestamp(block["timestamp"], tz=timezone.utc)
         # Update the cache with the newly fetched blocks
-        with open("cache_timestamps.pkl", "wb") as f:
+        with open("cache/cache_timestamps.pkl", "wb") as f:
             pickle.dump(timestamps, f)
         print(f"  Timestamp cache updated with missing blocks")
 
