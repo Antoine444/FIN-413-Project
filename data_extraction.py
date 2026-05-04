@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from collections import defaultdict
 
 import requests
+import pickle
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -44,7 +45,7 @@ POOL_DEPLOY_BLOCK   = 12_376_729          # Block at which the pool was deployed
 # Study window — blocks corresponding to:
 #   Start: 1 October 2025 00:00 UTC
 #   End:   31 March 2026  23:59 UTC
-# These can be verified / refined using eth_getBlockByNumber on a block explorer.
+# These were found using the find_blocks.py script.
 STUDY_START_BLOCK   = 23_479_244          # ≈ 1 Oct 2025
 STUDY_END_BLOCK     = 24_773_861          # ≈ 31 Mar 2026
 
@@ -62,7 +63,8 @@ MAX_TICK            =  887_272
 
 # RPC batching — number of blocks per eth_getLogs request.
 # Free-tier providers typically reject ranges wider than 2000 blocks.
-BLOCK_CHUNK_SIZE    = 2_000
+# Infura accepts up to 10_000
+BLOCK_CHUNK_SIZE    = 5_000
 
 # Retry settings for RPC calls
 MAX_RETRIES         = 7
@@ -194,48 +196,133 @@ def retry_call(fn, *args, **kwargs):
 
 def fetch_block_timestamps(block_numbers: list) -> dict:
     """
-    Fetch the UTC timestamp for each block in block_numbers.
-    Makes one RPC call per unique block — NOT one per event.
-
-    Returns a dict: {block_number: datetime (UTC)}
+    Fetch timestamps for all unique blocks using JSON-RPC batching.
+    Results are cached to disk so repeated runs don't re-fetch.
+    Delete cache_timestamps.pkl to force a fresh fetch.
     """
-    unique_blocks = list(set(block_numbers))
-    timestamps = {}
-    print(f"  Fetching timestamps for {len(unique_blocks):,} unique blocks...")
-    for bn in tqdm(unique_blocks, desc="  Block timestamps"):
-        block = retry_call(w3.eth.get_block, bn)
-        timestamps[bn] = datetime.fromtimestamp(block["timestamp"], tz=timezone.utc)
+    BATCH_SIZE  = 500
+    CACHE_FILE  = "cache_timestamps.pkl"
+
+    # Load existing cache if it exists
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "rb") as f:
+            timestamps = pickle.load(f)
+        print(f"  Loaded timestamp cache ({len(timestamps):,} blocks already cached)")
+    else:
+        timestamps = {}
+
+    # Find which blocks are not yet cached
+    unique_blocks = list(set(block_numbers) - set(timestamps.keys()))
+
+    if not unique_blocks:
+        print(f"  All {len(set(block_numbers)):,} timestamps served from cache")
+        return timestamps
+
+    print(f"  Fetching {len(unique_blocks):,} new block timestamps "
+          f"({len(timestamps):,} already cached)...")
+
+    for i in tqdm(range(0, len(unique_blocks), BATCH_SIZE), desc="  Block timestamps"):
+        batch_blocks = unique_blocks[i : i + BATCH_SIZE]
+
+        payload = [
+            {
+                "jsonrpc": "2.0",
+                "method":  "eth_getBlockByNumber",
+                "params":  [hex(bn), False],
+                "id":      j,
+            }
+            for j, bn in enumerate(batch_blocks)
+        ]
+
+        response = retry_call(
+            requests.post,
+            RPC_URL,
+            json=payload,
+            timeout=30,
+        )
+        results = response.json()
+
+        for result in results:
+            if "result" in result and result["result"]:
+                bn = int(result["result"]["number"], 16)
+                ts = int(result["result"]["timestamp"], 16)
+                timestamps[bn] = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+        time.sleep(0.01)
+
+    # Save updated cache back to disk
+    with open(CACHE_FILE, "wb") as f:
+        pickle.dump(timestamps, f)
+    print(f"  Timestamp cache updated → {CACHE_FILE} ({len(timestamps):,} blocks total)")
+
     return timestamps
     
+    
+def fetch_logs_range(event, event_topic: str, from_block: int, to_block: int) -> list:
+    """
+    Fetch logs for a single block range, recursively splitting in half
+    if the provider returns a 'too many results' error.
+    """
+    try:
+        raw_logs = w3.eth.get_logs({
+            "address":   Web3.to_checksum_address(POOL_ADDRESS),
+            "topics":    [event_topic],
+            "fromBlock": hex(from_block),
+            "toBlock":   hex(to_block),
+        })
+        return [event.process_log(log) for log in raw_logs]
+
+    except Exception as e:
+        # Detect too-many-results error and split the range in half
+        if "-32005" in str(e) or "10000 results" in str(e):
+            mid = (from_block + to_block) // 2
+            if mid == from_block:
+                raise ValueError(f"Single block {from_block} has >10000 logs — cannot split further")
+            print(f"  [split] {from_block}→{to_block} too large, splitting at {mid}")
+            left  = fetch_logs_range(event, event_topic, from_block, mid)
+            right = fetch_logs_range(event, event_topic, mid + 1, to_block)
+            return left + right
+        raise
+
+
 def get_logs_chunked(event, from_block: int, to_block: int) -> list:
     """
-    Fetch all logs for a given contract event between from_block and to_block.
-    Uses w3.eth.get_logs directly (Web3.py v6+ compatible).
+    Fetch all logs for a given event, chunked by BLOCK_CHUNK_SIZE.
+    Automatically splits any chunk that exceeds the provider's result limit.
     """
     all_logs = []
-    event_topic = get_event_topic(event.event_name)  
+    event_topic = get_event_topic(event.event_name)
 
     chunks = range(from_block, to_block + 1, BLOCK_CHUNK_SIZE)
     for chunk_start in tqdm(chunks, desc=f"  Fetching {event.event_name} logs"):
         chunk_end = min(chunk_start + BLOCK_CHUNK_SIZE - 1, to_block)
-
-        raw_logs = retry_call(
-            w3.eth.get_logs,
-            {
-                "address":   Web3.to_checksum_address(POOL_ADDRESS),
-                "topics":    [event_topic],
-                "fromBlock": hex(chunk_start),
-                "toBlock":   hex(chunk_end),
-            }
-        )
-
-        # Decode each raw log into a named attribute dict
-        decoded = [event.process_log(log) for log in raw_logs]
-        all_logs.extend(decoded)
-        time.sleep(0.001)
+        logs = fetch_logs_range(event, event_topic, chunk_start, chunk_end)
+        all_logs.extend(logs)
+        time.sleep(0.01)
 
     return all_logs
 
+def get_logs_cached(event, from_block: int, to_block: int) -> list:
+    """
+    Wrapper around get_logs_chunked that caches results to disk.
+    If the cache file exists, load from it instead of making RPC calls.
+    Delete the .pkl file to force a fresh fetch.
+    """
+    cache_file = f"cache/cache_{event.event_name}_{from_block}_{to_block}.pkl"
+
+    if os.path.exists(cache_file):
+        print(f"  Loading {event.event_name} logs from cache: {cache_file}")
+        with open(cache_file, "rb") as f:
+            logs = pickle.load(f)
+        print(f"  Loaded {len(logs):,} {event.event_name} events from cache")
+        return logs
+
+    # Cache miss — fetch from RPC and save
+    logs = get_logs_chunked(event, from_block, to_block)
+    with open(cache_file, "wb") as f:
+        pickle.dump(logs, f)
+    print(f"  Cached {len(logs):,} {event.event_name} events → {cache_file}")
+    return logs
 
 def get_logs_chunked_multi(events: dict, from_block: int, to_block: int) -> dict:
     """
@@ -297,11 +384,28 @@ def get_logs_chunked_multi(events: dict, from_block: int, to_block: int) -> dict
                 decoded = event.process_log(raw_log)
                 results[name].append(decoded)
 
-        time.sleep(0.001)
+        time.sleep(0.01)
 
     for name, logs in results.items():
         print(f"  Fetched {len(logs):,} {name} events")
 
+    return results
+    
+def get_logs_multi_cached(events: dict, from_block: int, to_block: int) -> dict:
+    cache_file = f"cache/cache_multi_{from_block}_{to_block}.pkl"
+
+    if os.path.exists(cache_file):
+        print(f"  Loading Mint+Burn+Collect logs from cache: {cache_file}")
+        with open(cache_file, "rb") as f:
+            results = pickle.load(f)
+        for name, logs in results.items():
+            print(f"  Loaded {len(logs):,} {name} events from cache")
+        return results
+
+    results = get_logs_chunked_multi(events, from_block, to_block)
+    with open(cache_file, "wb") as f:
+        pickle.dump(results, f)
+    print(f"  Cached Mint+Burn+Collect logs → {cache_file}")
     return results
 
 def find_block_at_timestamp(target_ts: int, lo: int, hi: int) -> int:
@@ -376,9 +480,9 @@ def extract_slot0_snapshots() -> pd.DataFrame:
 # =============================================================================
 # OUTPUT 1 — swap_events.parquet
 # =============================================================================
-
+    
 def extract_swap_events() -> pd.DataFrame:
-    """
+	"""
     Fetch every Swap event emitted by the pool during the study window.
 
     The Swap event encodes:
@@ -392,61 +496,67 @@ def extract_swap_events() -> pd.DataFrame:
         amount0 > 0 means USDC flowed into the pool → taker received WETH → "buy_weth"
         amount0 < 0 means USDC flowed out of pool   → taker sent WETH    → "sell_weth"
     """
+    
     print("\n=== Output 1: swap_events ===")
 
-    logs = get_logs_chunked(pool.events.Swap(), STUDY_START_BLOCK, STUDY_END_BLOCK)
+    logs = get_logs_cached(pool.events.Swap(), STUDY_START_BLOCK, STUDY_END_BLOCK)
     print(f"  Fetched {len(logs):,} Swap events")
 
-    # Fetch timestamps once per unique block (efficient)
     block_nums = [log["blockNumber"] for log in logs]
     timestamps = fetch_block_timestamps(block_nums)
 
+    # Identify any blocks that are still missing from the cache
+    missing_blocks = list(set(block_nums) - set(timestamps.keys()))
+    if missing_blocks:
+        print(f"  Fetching {len(missing_blocks):,} missing blocks individually...")
+        for bn in tqdm(missing_blocks, desc="  Missing blocks"):
+            block = retry_call(w3.eth.get_block, bn)
+            timestamps[bn] = datetime.fromtimestamp(block["timestamp"], tz=timezone.utc)
+        # Update the cache with the newly fetched blocks
+        with open("cache_timestamps.pkl", "wb") as f:
+            pickle.dump(timestamps, f)
+        print(f"  Timestamp cache updated with missing blocks")
+
+    # Now build the DataFrame — all blocks guaranteed to be in timestamps
     rows = []
     for log in logs:
         args = log["args"]
-        a0   = args["amount0"]   # signed int256, raw USDC units
-        a1   = args["amount1"]   # signed int256, raw WETH units
+        a0   = args["amount0"]
+        a1   = args["amount1"]
         sqrt = args["sqrtPriceX96"]
 
-        # Decimal-adjusted amounts (human-readable)
-        a0_dec = a0 / (10 ** USDC_DECIMALS)   # USDC, signed
-        a1_dec = a1 / (10 ** WETH_DECIMALS)   # WETH, signed
+        a0_dec = a0 / (10 ** USDC_DECIMALS)
+        a1_dec = a1 / (10 ** WETH_DECIMALS)
 
-        # Trade direction from taker's perspective
-        # If USDC goes INTO pool (amount0 > 0), taker is buying WETH
-        direction = "buy_weth" if a0 > 0 else "sell_weth"
-
-        # Notional USD value: USDC amount is already in USD terms
-        # We use the absolute value of the USDC leg as notional
+        direction    = "buy_weth" if a0 > 0 else "sell_weth"
         notional_usd = abs(a0_dec)
 
         rows.append({
-            "block_number":         log["blockNumber"],
-            "block_timestamp":      timestamps[log["blockNumber"]],
-            "transaction_hash":     log["transactionHash"].hex(),
-            "amount0_raw":          a0,                              # signed, raw USDC units
-            "amount0_decimal":      a0_dec,                          # signed, human-readable USDC
-            "amount1_raw":          a1,                              # signed, raw WETH units
-            "amount1_decimal":      a1_dec,                          # signed, human-readable WETH
-            "sqrtPriceX96":         sqrt,                            # raw, after swap
-            "price_usdc_per_weth":  sqrtPriceX96_to_price(sqrt),    # human-readable
-            "liquidity":            args["liquidity"],               # active liquidity (uint128)
-            "tick":                 args["tick"],                    # active tick after swap
-            "trade_direction":      direction,
-            "notional_usd":         notional_usd,
+            "block_number":        log["blockNumber"],
+            "block_timestamp":     timestamps[log["blockNumber"]],
+            "transaction_hash":    log["transactionHash"].hex(),
+            "amount0_raw":         str(a0),
+            "amount0_decimal":     a0_dec,
+            "amount1_raw":         str(a1),
+            "amount1_decimal":     a1_dec,
+            "sqrtPriceX96":        str(sqrt),
+            "price_usdc_per_weth": sqrtPriceX96_to_price(sqrt),
+            "liquidity":           str(args["liquidity"]),
+            "tick":                args["tick"],
+            "trade_direction":     direction,
+            "notional_usd":        notional_usd,
         })
 
     df = pd.DataFrame(rows)
-    
     df["sqrtPriceX96"] = df["sqrtPriceX96"].astype(str)
     df["liquidity"]    = df["liquidity"].astype(str)
     df["amount0_raw"]  = df["amount0_raw"].astype(str)
     df["amount1_raw"]  = df["amount1_raw"].astype(str)
-    
+
     df.to_parquet(OUT_SWAP, index=False)
     print(f"  Saved {len(df):,} rows → {OUT_SWAP}")
     return df
-
+    
 # =============================================================================
 # OUTPUT 2 — mint_burn_events.parquet
 # =============================================================================
@@ -467,7 +577,7 @@ def extract_mint_burn_events() -> pd.DataFrame:
     print("  (Single-pass scan for Mint + Burn + Collect simultaneously)")
 
     # Single scan for all three event types
-    all_logs = get_logs_chunked_multi(
+    all_logs = get_logs_multi_cached(
         {
             "Mint":    pool.events.Mint(),
             "Burn":    pool.events.Burn(),

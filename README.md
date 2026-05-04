@@ -2,6 +2,9 @@
 
 ## Setup
 
+**Requirements: anaconda + Linux environment**
+Those without a Linux environment may want to adapt the 'setup.sh' script. 
+
 1. Clone the repository and navigate into it
 2. Run `bash setup.sh`
 3. Copy your RPC URL into a `.env` file: e.g. `RPC_URL=https://mainnet.infura.io/v3/YOUR_KEY`
