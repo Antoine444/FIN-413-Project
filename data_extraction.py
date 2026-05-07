@@ -1001,6 +1001,11 @@ def validate_liquidity_map(snap_df: pd.DataFrame, slot0_df: pd.DataFrame):
     print(f"  {'Tick':>10}  {'Our liquidityNet':>18}  {'Chain liquidityNet':>18}  {'Match':>6}")
     print("  " + "-" * 60)
 
+    # Verify no negative liquidity_gross values exist (would indicate replay bug)
+    neg_gross = snap_subset[snap_subset["liquidity_gross"].apply(lambda x: int(x) < 0)]    
+    if len(neg_gross) > 0:
+        print(f"  WARNING: {len(neg_gross)} ticks have negative liquidityGross — replay ordering bug")
+
     all_match = True
     for tick in sample_ticks:
         # Call pool.ticks(tick) at the specific historical block
@@ -1010,6 +1015,8 @@ def validate_liquidity_map(snap_df: pd.DataFrame, slot0_df: pd.DataFrame):
         )
         chain_gross = chain_result[0]   # liquidityGross (uint128)
         chain_net   = chain_result[1]   # liquidityNet   (int128)
+        
+        print(f"  Full chain result for tick {tick}: {chain_result}")
 
         our_row   = snap_subset[snap_subset["tick"] == tick].iloc[0]
         our_net   = int(our_row["liquidity_net"])
@@ -1093,12 +1100,30 @@ def main():
     # Run extractions in dependency order
     #slot0_df    = extract_slot0_snapshots()     # Output 4 (needed by Output 3)
     slot0_df    = pd.read_parquet(OUT_SLOT0_SNAP) 
-    swap_df     = extract_swap_events()          # Output 1
-    #swap_df     = pd.read_parquet(OUT_SWAP)
+    #swap_df     = extract_swap_events()          # Output 1
+    swap_df     = pd.read_parquet(OUT_SWAP)
     #mb_df       = extract_mint_burn_events()     # Output 2
     mb_df       = pd.read_parquet(OUT_MINT_BURN)
+    
+    # The above data frame contains duplicates, we must remove them
+    before = len(mb_df)
+    mb_df = mb_df.drop_duplicates(subset=[
+        "transaction_hash",
+        "event_type", 
+        "tick_lower",
+        "tick_upper",
+        "liquidity_raw",    # same tx can have same ticks but different amounts
+        "amount0_raw",      # include token amounts to be safe
+        "amount1_raw",
+    ])
+    after = len(mb_df)
+    print(f"Removed {before - after:,} duplicates ({before:,} → {after:,} rows)")
+    mb_df = mb_df.sort_values("block_number").reset_index(drop=True)
+    
     snap_df     = extract_liquidity_snapshots(mb_df, slot0_df)  # Output 3
+    #snap_df     = pd.read_parquet(OUT_LIQ_SNAP)
 
+    
     # Run validations
     validate_liquidity_map(snap_df, slot0_df)
     validate_swap_volume(swap_df)
