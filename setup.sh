@@ -9,4 +9,4 @@ conda init uniswap_project
 conda activate uniswap_project
 
 # Install dependencies
-pip install web3 pandas pyarrow python-dotenv requests tqdm
+pip install web3 pandas pyarrow python-dotenv requests tqdm plt
