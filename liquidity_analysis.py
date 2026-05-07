@@ -90,49 +90,54 @@ def sqrt_price_x96_to_price(sqrt_price_x96_str: str) -> float:
     return (sqp / Q96) ** 2 * DECIMAL_ADJ
 
 
-def token_amounts_from_liquidity(L, sqrt_pa, sqrt_pb, sqrt_pc):
+def token_amounts_from_liquidity(L, sqrt_pa_raw, sqrt_pb_raw, sqrt_pc_raw):
     """
     Uniswap V3 virtual reserve formulas.
 
-    Given active liquidity L and sqrt-prices for the position bounds (pa, pb)
-    and the current pool price (pc), returns (amount_usdc, amount_weth).
+    All sqrt-price arguments must be in **raw** (non-decimal-adjusted) units,
+    i.e.  sqrt_p_raw = sqrt(1.0001^tick)  with NO extra decimal factor.
 
     Formulas (from Uniswap V3 whitepaper, §6.2–6.3):
 
       Case 1 — current price below range  (pc ≤ pa):
-        amount_usdc = L · (1/√pa − 1/√pb)   [all USDC, no WETH]
-        amount_weth = 0
+        raw_x = L · (1/√pa − 1/√pb)   [all token0 = USDC]
+        raw_y = 0
 
       Case 2 — current price above range  (pc ≥ pb):
-        amount_usdc = 0
-        amount_weth = L · (√pb − √pa)        [all WETH, no USDC]
+        raw_x = 0
+        raw_y = L · (√pb − √pa)        [all token1 = WETH]
 
       Case 3 — current price in range  (pa < pc < pb):
-        amount_usdc = L · (1/√pc − 1/√pb)
-        amount_weth = L · (√pc − √pa)
+        raw_x = L · (1/√pc − 1/√pb)
+        raw_y = L · (√pc − √pa)
 
-    USDC amounts are in units of raw USDC / 1e6 (i.e. human-readable USDC).
-    WETH amounts are in units of raw WETH / 1e18 (i.e. human-readable WETH).
-    To convert to USD we use: USD ≈ amount_usdc + amount_weth × price_usdc_per_weth.
+    The raw amounts are then converted to human-readable token units:
+        amount_usdc = raw_x / 1e6          (USDC has 6 decimals)
+        amount_weth = raw_y / 1e18         (WETH has 18 decimals)
+
+    USD value = amount_usdc + amount_weth * price_usdc_per_weth
     """
-    if sqrt_pc <= sqrt_pa:
+    if sqrt_pc_raw <= sqrt_pa_raw:
         # entirely above current price → all USDC
-        amount_usdc = L * (1.0 / sqrt_pa - 1.0 / sqrt_pb)
-        amount_weth = 0.0
-    elif sqrt_pc >= sqrt_pb:
+        raw_x = L * (1.0 / sqrt_pa_raw - 1.0 / sqrt_pb_raw)
+        raw_y = 0.0
+    elif sqrt_pc_raw >= sqrt_pb_raw:
         # entirely below current price → all WETH
-        amount_usdc = 0.0
-        amount_weth = L * (sqrt_pb - sqrt_pa)
+        raw_x = 0.0
+        raw_y = L * (sqrt_pb_raw - sqrt_pa_raw)
     else:
         # current price is inside the range
-        amount_usdc = L * (1.0 / sqrt_pc - 1.0 / sqrt_pb)
-        amount_weth = L * (sqrt_pc - sqrt_pa)
+        raw_x = L * (1.0 / sqrt_pc_raw - 1.0 / sqrt_pb_raw)
+        raw_y = L * (sqrt_pc_raw - sqrt_pa_raw)
+
+    amount_usdc = raw_x / 10 ** DECIMALS_USDC
+    amount_weth = raw_y / 10 ** DECIMALS_WETH
     return amount_usdc, amount_weth
 
 
 def compute_tvl_for_snapshot(snap_liq: pd.DataFrame,
                               current_tick: int,
-                              sqrt_pc: float,
+                              sqrt_pc_raw: float,
                               price_usdc: float) -> dict:
     """
     Compute TVL decomposition for a single snapshot.
@@ -141,8 +146,9 @@ def compute_tvl_for_snapshot(snap_liq: pd.DataFrame,
     ----------
     snap_liq    : rows from liquidity_snapshots for this snapshot
     current_tick: pool's active tick at snapshot (from slot0)
-    sqrt_pc     : sqrt(price) in raw terms (not adjusted for decimals)
-    price_usdc  : USDC/WETH price (decimal-adjusted)
+    sqrt_pc_raw : sqrt(price) in raw (non-decimal-adjusted) units,
+                  i.e. sqrt(1.0001^current_tick)
+    price_usdc  : USDC/WETH price (decimal-adjusted, for USD conversion)
 
     Returns
     -------
@@ -163,13 +169,14 @@ def compute_tvl_for_snapshot(snap_liq: pd.DataFrame,
         if L <= 0:
             continue
 
-        # sqrt prices at range boundaries (raw, not decimal-adjusted)
-        # price = 1.0001^tick * DECIMAL_ADJ  →  sqrt_price_raw = sqrt(1.0001^tick) * sqrt(DECIMAL_ADJ)
-        sqrt_adj = np.sqrt(DECIMAL_ADJ)
-        sqrt_pa  = np.sqrt(1.0001 ** tick_lo) * sqrt_adj
-        sqrt_pb  = np.sqrt(1.0001 ** tick_hi) * sqrt_adj
+        # Raw sqrt prices at range boundaries — NO decimal adjustment here.
+        # The decimal correction is applied inside token_amounts_from_liquidity.
+        sqrt_pa_raw = np.sqrt(1.0001 ** tick_lo)
+        sqrt_pb_raw = np.sqrt(1.0001 ** tick_hi)
 
-        amt_usdc, amt_weth = token_amounts_from_liquidity(L, sqrt_pa, sqrt_pb, sqrt_pc)
+        amt_usdc, amt_weth = token_amounts_from_liquidity(
+            L, sqrt_pa_raw, sqrt_pb_raw, sqrt_pc_raw
+        )
         usd_val = amt_usdc + amt_weth * price_usdc
 
         if tick_lo <= current_tick < tick_hi:
@@ -205,13 +212,12 @@ for block in snap_blocks:
     price_usdc  = float(s0["price_usdc_per_weth"])
     current_tick = int(s0["current_tick"])
 
-    sqrt_adj = np.sqrt(DECIMAL_ADJ)
-    sqrt_pc  = np.sqrt(1.0001 ** current_tick) * sqrt_adj   # approximation via tick
+    sqrt_pc_raw = np.sqrt(1.0001 ** current_tick)   # raw, no decimal adjustment
 
     snap_liq = liq_df[liq_df["snapshot_block"] == block].copy()
 
     # ---- TVL decomposition ----
-    tvl = compute_tvl_for_snapshot(snap_liq, current_tick, sqrt_pc, price_usdc)
+    tvl = compute_tvl_for_snapshot(snap_liq, current_tick, sqrt_pc_raw, price_usdc)
 
     # ---- ILR(k) ----
     total_liq = snap_liq["active_liquidity"].astype(float).sum()
@@ -225,11 +231,31 @@ for block in snap_blocks:
         ilr[k] = band_liq / total_liq if total_liq > 0 else 0.0
 
     # ---- L-HHI ----
-    liqs = snap_liq["active_liquidity"].astype(float).values
-    liqs = liqs[liqs > 0]
-    if liqs.sum() > 0:
-        shares = liqs / liqs.sum()
-        l_hhi  = float((shares ** 2).sum())
+    # Computing HHI directly on per-tick active_liquidity rows is misleading:
+    # a wide LP position spanning N ticks contributes to N rows, so wide
+    # positions are over-counted relative to narrow ones, causing artefact spikes.
+    #
+    # Fix: aggregate into coarse price buckets (each bucket = 100 tick-spacings
+    # = 1000 ticks wide) within a ±40 % price window, then compute HHI on the
+    # bucketed shares. This treats each price region as one unit of concentration
+    # regardless of how many tick rows it spans.
+    lo_hhi = price_usdc * 0.60
+    hi_hhi = price_usdc * 1.40
+    hhi_mask = (snap_liq["price_lower"] >= lo_hhi) & (snap_liq["price_upper"] <= hi_hhi)
+    hhi_sub = snap_liq.loc[hhi_mask].copy()
+
+    BUCKET_TICKS = 100 * TICK_SPACING   # 1000 ticks per bucket
+    if len(hhi_sub) > 0:
+        hhi_sub["bucket"] = (hhi_sub["tick"] // BUCKET_TICKS) * BUCKET_TICKS
+        bucket_liq = hhi_sub.groupby("bucket")["active_liquidity"].apply(
+            lambda x: x.map(float).mean()
+        )
+        bucket_liq = bucket_liq[bucket_liq > 0]
+        if bucket_liq.sum() > 0:
+            shares = bucket_liq / bucket_liq.sum()
+            l_hhi  = float((shares ** 2).sum())
+        else:
+            l_hhi = 0.0
     else:
         l_hhi = 0.0
 
