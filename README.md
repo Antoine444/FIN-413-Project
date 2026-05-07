@@ -69,9 +69,9 @@ One row per initialised tick per daily snapshot. Snapshots are taken at the bloc
 | `snapshot_block` | int64 | block | Block number of the daily snapshot (closest block to 00:00 UTC) |
 | `snapshot_timestamp` | datetime64[UTC] | UTC datetime | Timestamp of the snapshot block |
 | `tick` | int32 | tick index | Tick index of an initialised tick boundary (only ticks with liquidityGross > 0 are included) |
-| `liquidity_net` | int64 | liquidity units | Net liquidity change at this tick: positive at a position's lower boundary, negative at its upper boundary. Used to compute active liquidity by walking from MIN_TICK upward |
-| `liquidity_gross` | int64 | liquidity units | Total absolute liquidity referencing this tick across all positions. A tick is initialised (active) when this value is greater than zero |
-| `active_liquidity` | int64 | liquidity units | Accumulated active liquidity in the range starting at this tick, computed by summing liquidityNet from MIN_TICK up to and including this tick |
+| `liquidity_net` | string | liquidity units | Net liquidity change at this tick: positive at a position's lower boundary, negative at its upper boundary. Used to compute active liquidity by walking from MIN_TICK upward (int64); stored as string to avoid overflow |
+| `liquidity_gross` | string | liquidity units | Total absolute liquidity referencing this tick across all positions. A tick is initialised (active) when this value is greater than zero (int64); stored as string to avoid overflow |
+| `active_liquidity` | string | liquidity units | Accumulated active liquidity in the range starting at this tick, computed by summing liquidityNet from MIN_TICK up to and including this tick (int64); stored as string to avoid overflow |
 | `price_lower` | float64 | USDC/WETH | Human-readable price at the lower edge of this tick, computed as 1.0001^tick adjusted for token decimals |
 | `price_upper` | float64 | USDC/WETH | Human-readable price at the upper edge of this tick, computed as 1.0001^(tick + 10) adjusted for token decimals |
 
