@@ -64,7 +64,7 @@ MAX_TICK            =  887_272
 # RPC batching — number of blocks per eth_getLogs request.
 # Free-tier providers typically reject ranges wider than 2000 blocks.
 # Infura accepts up to 10_000
-BLOCK_CHUNK_SIZE    = 5_000
+BLOCK_CHUNK_SIZE    = 1_500
 
 # Retry settings for RPC calls
 MAX_RETRIES         = 7
@@ -199,11 +199,15 @@ def fetch_block_timestamps(block_numbers: list) -> dict:
     Fetch timestamps for all unique blocks using JSON-RPC batching.
     Results are cached to disk so repeated runs don't re-fetch.
     Delete cache_timestamps.pkl to force a fresh fetch.
-    """
-    BATCH_SIZE  = 500
-    CACHE_FILE  = "cache_timestamps.pkl"
+    
+    Auto-saves progress every 500 blocks to prevent data loss.
+    """	
+    BATCH_SIZE  = 20  # Each call costs 20 CUs
+    SLEEP_PER_BATCH = 1.0  # 1.0 s — respects 500 CU/s rate limit
+    CACHE_FILE  = "cache/cache_timestamps.pkl"
+    SAVE_INTERVAL = 500  # Save to disk every 500 successfully fetched blocks
 
-    # Load existing cache if it exists
+    # Load existing cache if available
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE, "rb") as f:
             timestamps = pickle.load(f)
@@ -211,9 +215,7 @@ def fetch_block_timestamps(block_numbers: list) -> dict:
     else:
         timestamps = {}
 
-    # Find which blocks are not yet cached
     unique_blocks = list(set(block_numbers) - set(timestamps.keys()))
-
     if not unique_blocks:
         print(f"  All {len(set(block_numbers)):,} timestamps served from cache")
         return timestamps
@@ -221,42 +223,119 @@ def fetch_block_timestamps(block_numbers: list) -> dict:
     print(f"  Fetching {len(unique_blocks):,} new block timestamps "
           f"({len(timestamps):,} already cached)...")
 
-    for i in tqdm(range(0, len(unique_blocks), BATCH_SIZE), desc="  Block timestamps"):
-        batch_blocks = unique_blocks[i : i + BATCH_SIZE]
+    # Track progress for auto-saving
+    blocks_fetched_since_last_save = 0
+    initial_cache_size = len(timestamps)
 
+    def save_cache():
+        """Helper function to save cache to disk"""
+        with open(CACHE_FILE, "wb") as f:
+            pickle.dump(timestamps, f)
+
+    def fetch_batch(blocks_to_fetch: list, retry: int = 3) -> list:
+        nonlocal blocks_fetched_since_last_save
+        
         payload = [
-            {
-                "jsonrpc": "2.0",
-                "method":  "eth_getBlockByNumber",
-                "params":  [hex(bn), False],
-                "id":      j,
-            }
-            for j, bn in enumerate(batch_blocks)
+            {"jsonrpc": "2.0", "method": "eth_getBlockByNumber",
+             "params": [hex(bn), False], "id": j}
+            for j, bn in enumerate(blocks_to_fetch)
         ]
+	
+        for attempt in range(retry):
+            response = requests.post(RPC_URL, json=payload, timeout=30)
+            results  = response.json()
+	
+            # Batch-level rejection
+            if isinstance(results, dict):
+                error_code = results.get("error", {}).get("code", None)
+                if error_code == -32005:
+                    wait = 2 ** attempt * 2   # 2s, 4s, 8s
+                    print(f"  Batch-level rate limit, waiting {wait}s (attempt {attempt+1}/{retry})…")
+                    time.sleep(wait)
+                    continue
+                print(f"  Batch-level error: {results.get('error', results)}")
+                return blocks_to_fetch
+	
+            # Check if *any* entry is a rate limit error (no id field)
+            rate_limited = any(
+                isinstance(r, dict) and "id" not in r and r.get("code") == -32005
+                for r in results
+            )
+            if rate_limited:
+                wait = 2 ** attempt * 2
+                print(f"  Entry-level rate limit, waiting {wait}s (attempt {attempt+1}/{retry})…")
+                time.sleep(wait)
+                continue
+	
+            # Process valid results
+            failed = []
+            for result in results:
+                if not isinstance(result, dict) or "id" not in result:
+                    print(f"  Warning: unexpected entry: {result}")
+                    continue
+                if "result" in result and result["result"]:
+                    bn = int(result["result"]["number"], 16)
+                    ts = int(result["result"]["timestamp"], 16)
+                    timestamps[bn] = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    
+                    # Increment counter and save if threshold reached
+                    blocks_fetched_since_last_save += 1
+                    if blocks_fetched_since_last_save >= SAVE_INTERVAL:
+                        save_cache()
+                        print(f"    Auto-saved after {blocks_fetched_since_last_save} new blocks "
+                              f"(total: {len(timestamps):,})")
+                        blocks_fetched_since_last_save = 0
+                else:
+                    failed.append(blocks_to_fetch[result["id"]])
+	
+            time.sleep(SLEEP_PER_BATCH)
+            return failed
 
-        response = retry_call(
-            requests.post,
-            RPC_URL,
-            json=payload,
-            timeout=30,
-        )
-        results = response.json()
-
-        for result in results:
-            if "result" in result and result["result"]:
-                bn = int(result["result"]["number"], 16)
-                ts = int(result["result"]["timestamp"], 16)
-                timestamps[bn] = datetime.fromtimestamp(ts, tz=timezone.utc)
-
-        time.sleep(0.01)
-
-    # Save updated cache back to disk
-    with open(CACHE_FILE, "wb") as f:
-        pickle.dump(timestamps, f)
-    print(f"  Timestamp cache updated → {CACHE_FILE} ({len(timestamps):,} blocks total)")
-
-    return timestamps
+        # All retries exhausted
+        print(f"  Warning: batch failed after {retry} attempts, marking all as failed.")
+        return blocks_to_fetch
     
+    # ---- Pass 1: full batches ------------------------------------------------
+    all_failed = []
+    for i in tqdm(range(0, len(unique_blocks), BATCH_SIZE), desc="  Block timestamps"):
+        batch  = unique_blocks[i : i + BATCH_SIZE]
+        failed = fetch_batch(batch)
+        if failed:
+            all_failed.extend(failed)
+
+    # Save after pass 1 to ensure progress is captured
+    save_cache()
+    print(f"  Saved after pass 1 ({len(timestamps):,} blocks total)")
+    blocks_fetched_since_last_save = 0  # Reset counter
+
+    # ---- Pass 2: retry failed blocks in smaller batches ---------------------
+    if all_failed:
+        RETRY_BATCH_SIZE = 50
+        print(f"  Retrying {len(all_failed):,} null results in batches of {RETRY_BATCH_SIZE}...")
+        still_failed = []
+        for i in tqdm(range(0, len(all_failed), RETRY_BATCH_SIZE), desc="  Retry batches"):
+            batch  = all_failed[i : i + RETRY_BATCH_SIZE]
+            failed = fetch_batch(batch)
+            if failed:
+                still_failed.extend(failed)
+        
+        # Save after retry pass
+        if still_failed:
+            print(f"  Warning: {len(still_failed):,} blocks could not be fetched after retry.")
+        save_cache()
+        print(f"  Saved after retry pass ({len(timestamps):,} blocks total)")
+    
+    # ---- Final save and cleanup ----------------------------------------------
+    save_cache()
+    
+    # Calculate stats
+    newly_fetched = len(timestamps) - initial_cache_size
+    print(f"  Timestamp cache updated → {CACHE_FILE}")
+    print(f"    Total blocks: {len(timestamps):,}")
+    print(f"    Newly fetched: {newly_fetched:,}")
+    print(f"    Cache misses: {len(unique_blocks) - newly_fetched:,}")
+    
+    return timestamps    
     
 def fetch_logs_range(event, event_topic: str, from_block: int, to_block: int) -> list:
     """
@@ -329,6 +408,8 @@ def get_logs_chunked_multi(events: dict, from_block: int, to_block: int) -> dict
     Fetch logs for multiple event types in a single pass over the block range.
     This is 3x more efficient than calling get_logs_chunked separately for each
     event, as it makes one RPC call per chunk instead of three.
+    
+    Progress is saved every 10 chunks to prevent data loss during long runs.
 
     Parameters
     ----------
@@ -346,54 +427,144 @@ def get_logs_chunked_multi(events: dict, from_block: int, to_block: int) -> dict
     -------
     dict : mapping of event_name -> list of decoded log objects
     """
-    # Build a mapping from topic hash -> (event_name, event_object)
-    # Each event has a unique keccak256 topic hash derived from its signature
+
     topic_map = {}
     for name, event in events.items():
-        topic_hash = get_event_topic(name)  
+        topic_hash = get_event_topic(name)
         topic_map[topic_hash] = (name, event)
 
-    # All topic hashes we want to listen for
     all_topics = list(topic_map.keys())
-
-    # Initialise result buckets
     results = {name: [] for name in events}
+    
+    # Setup for progressive caching
+    CHUNKS_BETWEEN_SAVES = 10  # Save every 10 chunks (configurable)
+    progress_file = f"cache/cache_multi_{from_block}_{to_block}_progress.pkl"
+    chunks_processed_since_save = 0
+    
+    # Try to load existing progress
+    if os.path.exists(progress_file):
+        try:
+            with open(progress_file, "rb") as f:
+                progress_data = pickle.load(f)
+                results = progress_data["results"]
+                last_processed_chunk_start = progress_data["last_chunk_start"]
+                print(f"  Resuming from saved progress (last chunk start: {last_processed_chunk_start})")
+        except Exception as e:
+            print(f"  Warning: Could not load progress file: {e}")
+            last_processed_chunk_start = None
+    else:
+        last_processed_chunk_start = None
 
+    def save_progress(current_chunk_start: int = None):
+        """Save current results to progress file"""
+        progress_data = {
+            "results": results,
+            "last_chunk_start": current_chunk_start,
+            "from_block": from_block,
+            "to_block": to_block
+        }
+        with open(progress_file, "wb") as f:
+            pickle.dump(progress_data, f)
+
+    def fetch_chunk(chunk_start: int, chunk_end: int, chunk_size: int):
+        """
+        Recursively fetch logs for [chunk_start, chunk_end].
+        If Infura returns a 'query returned more than 10,000 results' error,
+        halve the chunk size and retry both halves.
+        """
+        nonlocal chunks_processed_since_save
+        
+        try:
+            raw_logs = retry_call(
+                w3.eth.get_logs,
+                {
+                    "address":   Web3.to_checksum_address(POOL_ADDRESS),
+                    "topics":    [all_topics],
+                    "fromBlock": hex(chunk_start),
+                    "toBlock":   hex(chunk_end),
+                }
+            )
+            for raw_log in raw_logs:
+                log_topic = "0x" + raw_log["topics"][0].hex()
+                if log_topic in topic_map:
+                    name, event = topic_map[log_topic]
+                    decoded = event.process_log(raw_log)
+                    results[name].append(decoded)
+            
+            # Count this chunk as processed
+            chunks_processed_since_save += 1
+            
+            # Auto-save if we've processed enough chunks
+            if chunks_processed_since_save >= CHUNKS_BETWEEN_SAVES:
+                save_progress(chunk_end)
+                print(f"    Auto-saved progress after {CHUNKS_BETWEEN_SAVES} chunks "
+                      f"(Total: {sum(len(v) for v in results.values()):,} events collected)")
+                chunks_processed_since_save = 0
+            
+            time.sleep(1.0)  # eth_getLogs costs 255 CUs on Infura, max CU/s is 500
+
+        except Exception as e:
+            err_str = str(e).lower()
+            if any(x for x in [
+                "query returned more than",
+                "10000",
+                "too many results",
+                "bad request",
+                "response size",
+                "limit exceeded",
+            ] if x in err_str):
+                new_chunk_size = chunk_size // 2
+                if new_chunk_size < 1:
+                    raise ValueError(
+                        f"Chunk size reached 1 block at [{chunk_start}, {chunk_end}] "
+                        f"and still too many logs. Something is wrong."
+                    )
+                mid = chunk_start + new_chunk_size
+                # Recursively fetch the two halves
+                fetch_chunk(chunk_start, mid - 1,   new_chunk_size)
+                fetch_chunk(mid,         chunk_end,  new_chunk_size)
+            else:
+                raise  # re-raise anything unrelated to the 10k limit
+
+    # Process chunks, skipping already processed ones if resuming
     chunks = range(from_block, to_block + 1, BLOCK_CHUNK_SIZE)
+    
+    # Skip chunks if resuming from progress
+    skip_until = None
+    if last_processed_chunk_start is not None:
+        skip_until = last_processed_chunk_start
+    
     for chunk_start in tqdm(chunks, desc="  Fetching Mint+Burn+Collect logs"):
+        # Skip already processed chunks when resuming
+        if skip_until is not None and chunk_start <= skip_until:
+            continue
+        
         chunk_end = min(chunk_start + BLOCK_CHUNK_SIZE - 1, to_block)
-
-        # Single RPC call fetches all three event types at once.
-        # Passing a list of topics at position 0 acts as an OR filter:
-        # "return logs whose first topic is any of these hashes"
-        raw_logs = retry_call(
-            w3.eth.get_logs,
-            {
-                "address":   Web3.to_checksum_address(POOL_ADDRESS),
-                "topics":    [all_topics],   # OR across all three topic hashes
-                "fromBlock": hex(chunk_start),
-                "toBlock":   hex(chunk_end),
-            }
-        )
-
-        # Demultiplex: route each log to the correct bucket by its topic hash
-        for raw_log in raw_logs:
-            log_topic = raw_log["topics"][0].hex()
-            if log_topic in topic_map:
-                name, event = topic_map[log_topic]
-                decoded = event.process_log(raw_log)
-                results[name].append(decoded)
-
-        time.sleep(0.01)
+        fetch_chunk(chunk_start, chunk_end, BLOCK_CHUNK_SIZE)
+        
+    # Final save to ensure everything is captured
+    save_progress(to_block)
+    
+    # Clean up progress file since we're done
+    if os.path.exists(progress_file):
+        os.remove(progress_file)
+        print(f"  Removed temporary progress file")
 
     for name, logs in results.items():
         print(f"  Fetched {len(logs):,} {name} events")
-
     return results
-    
-def get_logs_multi_cached(events: dict, from_block: int, to_block: int) -> dict:
-    cache_file = f"cache/cache_multi_{from_block}_{to_block}.pkl"
 
+
+def get_logs_multi_cached(events: dict, from_block: int, to_block: int) -> dict:
+    """
+    Fetch logs for multiple event types with disk caching.
+    Uses progressive caching to save intermediate results and allow resumption
+    if interrupted mid-execution.
+    """
+    cache_file = f"cache/cache_multi_{from_block}_{to_block}.pkl"
+    progress_file = f"cache/cache_multi_{from_block}_{to_block}_progress.pkl"
+
+    # Try to load from final cache first
     if os.path.exists(cache_file):
         print(f"  Loading Mint+Burn+Collect logs from cache: {cache_file}")
         with open(cache_file, "rb") as f:
@@ -401,8 +572,39 @@ def get_logs_multi_cached(events: dict, from_block: int, to_block: int) -> dict:
         for name, logs in results.items():
             print(f"  Loaded {len(logs):,} {name} events from cache")
         return results
-
+    
+    # Check for existing progress file (interrupted run)
+    if os.path.exists(progress_file):
+        print(f"  Found interrupted session! Resuming from progress file...")
+        # Load progress and continue
+        with open(progress_file, "rb") as f:
+            progress_data = pickle.load(f)
+            results = progress_data["results"]
+            for name, logs in results.items():
+                print(f"  Already fetched {len(logs):,} {name} events before interruption")
+        
+        # Continue fetching remaining chunks
+        print(f"  Resuming from block {progress_data['last_chunk_start'] + 1}...")
+        
+        # Calculate remaining chunks
+        remaining_results = get_logs_chunked_multi(events, from_block, to_block)
+        
+        # Merge results (should append to existing)
+        for name in events:
+            if name in remaining_results:
+                results[name].extend(remaining_results[name])
+        
+        # Save final cache
+        with open(cache_file, "wb") as f:
+            pickle.dump(results, f)
+        
+        print(f"  Cached final results → {cache_file}")
+        return results
+    
+    # Fresh run - fetch everything
     results = get_logs_chunked_multi(events, from_block, to_block)
+    
+    # Save final cache
     with open(cache_file, "wb") as f:
         pickle.dump(results, f)
     print(f"  Cached Mint+Burn+Collect logs → {cache_file}")
@@ -760,6 +962,12 @@ def extract_liquidity_snapshots(mint_burn_df: pd.DataFrame, slot0_df: pd.DataFra
             })
 
     df = pd.DataFrame(all_rows)
+    
+    # Cast oversized integer columns to string before saving to parquet
+    df["liquidity_net"]   = df["liquidity_net"].astype(str)
+    df["liquidity_gross"] = df["liquidity_gross"].astype(str)
+    df["active_liquidity"] = df["active_liquidity"].astype(str)
+
     df.to_parquet(OUT_LIQ_SNAP, index=False)
     print(f"  Saved {len(df):,} rows → {OUT_LIQ_SNAP}")
     return df
@@ -887,7 +1095,8 @@ def main():
     slot0_df    = pd.read_parquet(OUT_SLOT0_SNAP) 
     swap_df     = extract_swap_events()          # Output 1
     #swap_df     = pd.read_parquet(OUT_SWAP)
-    mb_df       = extract_mint_burn_events()     # Output 2
+    #mb_df       = extract_mint_burn_events()     # Output 2
+    mb_df       = pd.read_parquet(OUT_MINT_BURN)
     snap_df     = extract_liquidity_snapshots(mb_df, slot0_df)  # Output 3
 
     # Run validations
