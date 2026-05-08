@@ -1027,7 +1027,7 @@ def validate_liquidity_map(snap_df: pd.DataFrame, slot0_df: pd.DataFrame):
         if not match:
             all_match = False
 
-        print(f"  {tick:>10}  {our_net:>18}  {chain_net:>18}  {'✓' if match else '✗ MISMATCH':>6}")
+        print(f"  {tick:>10}  {our_net:>18}  {chain_net:>18}  {our_gross:>18}  {chain_gross:>18}  {'✓' if match else '✗ MISMATCH':>6}")
 
     print()
     if all_match:
