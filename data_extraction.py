@@ -1016,8 +1016,6 @@ def validate_liquidity_map(snap_df: pd.DataFrame, slot0_df: pd.DataFrame):
         chain_gross = chain_result[0]   # liquidityGross (uint128)
         chain_net   = chain_result[1]   # liquidityNet   (int128)
         
-        print(f"  Full chain result for tick {tick}: {chain_result}")
-
         our_row   = snap_subset[snap_subset["tick"] == tick].iloc[0]
         our_net   = int(our_row["liquidity_net"])
         our_gross = int(our_row["liquidity_gross"])
