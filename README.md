@@ -8,7 +8,10 @@ Those without a Linux environment may want to adapt the 'setup.sh' script.
 1. Clone the repository and navigate into it
 2. Run `bash setup.sh`
 3. Copy your RPC URL into a `.env` file: e.g. `RPC_URL=https://mainnet.infura.io/v3/YOUR_KEY`
-4. Run `python data_extraction.py`
+4. Run `python data_extraction.py` (Module 1 — extracts on-chain data)
+5. Run `python liquidity_analysis.py` (Module 2 — liquidity distribution figures)
+6. Run `python slippage_analysis.py` (Module 3 — slippage and execution-cost figures)
+7. Run `python lp_analytics.py` (Module 4 — LP fee income, IL, net P&L figures)
 
 # Data Dictionary
 
@@ -36,6 +39,8 @@ One row per Swap event emitted by the pool during the study window (1 October 20
 | `tick` | int32 | tick index | Active tick after the swap; corresponds to a price range of width 0.01% |
 | `trade_direction` | string | — | Direction from the taker's perspective: `buy_weth` (USDC in, WETH out) or `sell_weth` (WETH in, USDC out) |
 | `notional_usd` | float64 | USD | Notional trade size in USD, computed as the absolute value of amount0_decimal (USDC ≈ $1) |
+
+**Ordering convention.** Rows are written in the order returned by `eth_getLogs`, which sorts by `(block_number, transactionIndex, logIndex)` ascending. Pandas preserves this through to Parquet, so the row order IS the on-chain log order. Downstream code in `slippage_analysis.py` derives an `intra_block_idx` (= within-block rank) from this row order; explicit `log_index` / `transaction_index` columns are not stored. If row order is ever shuffled (e.g. by a custom sort) the within-block sequence is lost, so future iterations may want to materialise these columns directly during extraction.
 
 ---
 
@@ -109,3 +114,52 @@ One row per Collect event from pool deployment through the end of the study wind
 | `amount1_raw` | string | raw WETH (1e-18) | WETH fees collected in raw token units |
 | `amount0_decimal` | float64 | USDC | Human-readable USDC fees collected (amount0_raw / 1e6) |
 | `amount1_decimal` | float64 | WETH | Human-readable WETH fees collected (amount1_raw / 1e18) |
+
+---
+
+## 6. `lp_positions.parquet`
+
+One row per synthetic LP position built by Module 4 (`lp_analytics.py`). Five positions are constructed at the first daily snapshot block (entry) with a $100,000 USD notional each, then held to the last daily snapshot block (exit). Range widths are: ±0.1% (P1), ±0.5% (P2), ±2% (P3), ±10% (P4), full range (P5).
+
+Tick boundaries are rounded OUTWARD to multiples of `TICK_SPACING = 10` so the realised tick band contains the entry tick. Because USDC = token0, a higher USDC/WETH price corresponds to a lower V3 tick, so `tick_lower` is associated with `price_upper` and vice versa.
+
+| Column | Type | Unit | Description |
+|--------|------|------|-------------|
+| `position_id` | string | — | Position label: `P1`, `P2`, `P3`, `P4`, `P5` |
+| `range_pct` | float64 | fraction | Half-width of the requested price band (e.g. 0.001 for ±0.1%); `NaN` for P5 (full range) |
+| `tick_lower` | int64 | tick index | Lower V3 tick boundary (corresponds to upper USDC/WETH price) |
+| `tick_upper` | int64 | tick index | Upper V3 tick boundary (corresponds to lower USDC/WETH price) |
+| `price_lower_usdc_per_weth` | float64 | USDC/WETH | Lower edge of the realised USDC/WETH price band, `1e12 / 1.0001^tick_upper` |
+| `price_upper_usdc_per_weth` | float64 | USDC/WETH | Upper edge of the realised USDC/WETH price band, `1e12 / 1.0001^tick_lower` |
+| `L` | string | liquidity units | V3 liquidity computed so that `V_LP(entry) = $100,000` (uint128; stored as string to avoid overflow) |
+| `x0_weth` | float64 | WETH | Initial WETH deposit at entry, computed from `L` via the V3 virtual reserve formulas |
+| `y0_usdc` | float64 | USDC | Initial USDC deposit at entry, computed from `L` via the V3 virtual reserve formulas |
+| `entry_value_usd` | float64 | USD | `x0_weth * p_entry + y0_usdc`; should equal $100,000 to within float tolerance |
+| `entry_block` | int64 | block | Block of the first daily snapshot (entry block) |
+| `entry_timestamp` | datetime64[UTC] | UTC datetime | Timestamp of `entry_block` |
+| `exit_block` | int64 | block | Block of the last daily snapshot (exit block) |
+| `exit_timestamp` | datetime64[UTC] | UTC datetime | Timestamp of `exit_block` |
+
+---
+
+## 7. `lp_timeseries.parquet`
+
+One row per `(position, snapshot)` pair — five positions × 182 daily snapshots = 910 rows. Provides V_LP, V_HODL, IL, cumulative fee income (in USD, native USDC, and native WETH), and net P&L for each synthetic LP position at every daily snapshot in the study window.
+
+Fee income is computed from `swap_events.parquet` (not `collect_events.parquet`, which would represent real LP withdrawals). For each swap with `tick_lower <= swap.tick < tick_upper` and `entry_block < block_number <= exit_block`, the position's LP-side fee is `swap_amount * 0.0005 * L_position / swap.liquidity`, in the deposit-side token (USDC fee on USDC-in swaps; WETH fee on WETH-in swaps). The per-swap fees are bucketed by their *next* daily snapshot block and cumulated. We persist three cumulative columns: `cumulative_fee_usdc` and `cumulative_fee_weth` in their native tokens (no conversion ever applied), and `cumulative_fee_usd` with WETH fees converted at each swap's own price. The native columns let the reader re-aggregate under any valuation rule (e.g. value WETH at exit price instead of swap-time price). The PDF Task 4.2 spec phrase "ETH price prevailing at the time of collection" is read as "time of accrual" (= swap time) here; the alternative read (value at actual `collect()` time, i.e. exit for a passive LP) gives ~$2–3K smaller terminal USD fees per narrow position because ETH fell over the study window — see the `Fee re-aggregation` block in the script output.
+
+Impermanent loss uses the Uniswap V3 virtual reserve formulas (with the three cases for current price below / above / inside the position range) to evaluate `V_LP(t)` at every daily snapshot, then `IL(t) = V_HODL(t) - V_LP(t)`. A positive IL means the LP underperforms the HODL benchmark. The position-sizing step uses the exact slot0 `sqrtPriceX96 / 2^96` at the entry block (not the tick-implied `1.0001^(tick/2)` approximation), so `V_LP(entry) = V_HODL(entry) = $100,000` to float precision.
+
+| Column | Type | Unit | Description |
+|--------|------|------|-------------|
+| `position_id` | string | — | Position label (`P1`…`P5`); matches `lp_positions.parquet` |
+| `snapshot_block` | int64 | block | Block of the daily snapshot (from `slot0_snapshots.parquet`) |
+| `snapshot_timestamp` | datetime64[UTC] | UTC datetime | Timestamp of the snapshot block |
+| `price_usdc_per_weth` | float64 | USDC/WETH | Pool mid price at the snapshot block, copied from `slot0_snapshots` |
+| `v_lp_usd` | float64 | USD | LP principal value at the snapshot: `amount_weth(t) * p_t + amount_usdc(t)` |
+| `v_hodl_usd` | float64 | USD | HODL benchmark value at the snapshot: `x0_weth * p_t + y0_usdc` |
+| `impermanent_loss_usd` | float64 | USD | `v_hodl_usd − v_lp_usd`; positive = LP underperforms HODL |
+| `cumulative_fee_usd` | float64 | USD | Cumulative LP fee income through this snapshot, with WETH fees converted to USD at *each swap's own price* (= ETH price prevailing at accrual time). This is the column used to compute `net_pnl_usd`. |
+| `cumulative_fee_usdc` | float64 | USDC | Cumulative LP fee income through this snapshot, USDC leg only (in native USDC tokens; no conversion applied) |
+| `cumulative_fee_weth` | float64 | WETH | Cumulative LP fee income through this snapshot, WETH leg only (in native WETH tokens; no conversion applied) |
+| `net_pnl_usd` | float64 | USD | `cumulative_fee_usd − impermanent_loss_usd`; matches the figure 4.3 quantity |
