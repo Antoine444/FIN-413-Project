@@ -12,6 +12,8 @@ Those without a Linux environment may want to adapt the 'setup.sh' script.
 5. Run `python liquidity_analysis.py` (Module 2 — liquidity distribution figures)
 6. Run `python slippage_analysis.py` (Module 3 — slippage and execution-cost figures)
 7. Run `python lp_analytics.py` (Module 4 — LP fee income, IL, net P&L figures)
+8. Run `python hyperliquid_fetch.py` (Module 5 — Hyperliquid perp prices & funding rates)
+9. Run `python hedge_backtest.py` (Module 5 — delta-hedging backtest & figures)
 
 # Data Dictionary
 
@@ -163,3 +165,55 @@ Impermanent loss uses the Uniswap V3 virtual reserve formulas (with the three ca
 | `cumulative_fee_usdc` | float64 | USDC | Cumulative LP fee income through this snapshot, USDC leg only (in native USDC tokens; no conversion applied) |
 | `cumulative_fee_weth` | float64 | WETH | Cumulative LP fee income through this snapshot, WETH leg only (in native WETH tokens; no conversion applied) |
 | `net_pnl_usd` | float64 | USD | `cumulative_fee_usd − impermanent_loss_usd`; matches the figure 4.3 quantity |
+
+---
+
+## 8. `perp_prices.parquet`
+
+Hourly OHLCV for the Hyperliquid ETH perpetual (Module 5). The `close` column is the mark price for hedge P&L. Rows with `price_source = uniswap_slot0_bridge` fill gaps where the Hyperliquid API returns no candles (early in the study window).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `timestamp` | datetime64[UTC] | Hour start (UTC) |
+| `open`, `high`, `low`, `close` | float64 | USD prices |
+| `volume` | float64 | Perp volume (NaN for bridged rows) |
+| `price_source` | string | `hyperliquid` or `uniswap_slot0_bridge` |
+
+---
+
+## 9. `funding_rates.parquet`
+
+Hourly funding rates for the Hyperliquid ETH perpetual (Module 5).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `timestamp` | datetime64[UTC] | Hour (UTC) |
+| `funding_rate` | float64 | Hourly funding rate (longs pay shorts when > 0) |
+| `premium` | float64 | Premium component from API |
+| `coin` | string | `ETH` |
+| `oracle_price` | float64 | Mark price from `perp_prices.close` at the same hour |
+
+---
+
+## 10. `hedge_results.parquet`
+
+Hourly delta-hedging backtest output for 15 strategy variants (5 LP positions × rebalance intervals 1h / 4h / 24h).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `strategy_id` | string | e.g. `P3_4h` |
+| `position_id` | string | `P1`…`P5` |
+| `rebalance_hours` | int64 | 1, 4, or 24 |
+| `timestamp` | datetime64[UTC] | Hour (UTC) |
+| `eth_price` | float64 | Mark price (USD) |
+| `v_lp_usd`, `v_hodl_usd` | float64 | LP and HODL values at the hour |
+| `gross_il_usd` | float64 | `v_hodl_usd − v_lp_usd` |
+| `lp_delta_eth` | float64 | \|∂V_LP/∂p\| at the hour |
+| `hedge_size_eth` | float64 | Short perp size after last rebalance |
+| `hedge_pnl_cum_usd` | float64 | Cumulative mark-to-market on the short |
+| `funding_pnl_cum_usd` | float64 | Cumulative funding |
+| `trading_fees_cum_usd` | float64 | Cumulative rebalance fees (0.045% notional) |
+| `net_hedge_pnl_usd` | float64 | hedge + funding − trading fees |
+| `residual_il_usd` | float64 | `gross_il_usd − net_hedge_pnl_usd` |
+| `cumulative_fee_usd` | float64 | LP fees from Module 4 (daily, forward-filled) |
+| `net_position_pnl_usd` | float64 | `cumulative_fee_usd − residual_il_usd` |
