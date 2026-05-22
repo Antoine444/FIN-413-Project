@@ -2,8 +2,8 @@
 
 ## Setup
 
-**Requirements: anaconda + Linux environment**
-Those without a Linux environment may want to adapt the 'setup.sh' script. 
+**Requirements: anaconda + Linux environment.**
+Those without a Linux environment may want to adapt the `setup.sh` script.
 
 1. Clone the repository and navigate into it
 2. Run `bash setup.sh`
@@ -14,6 +14,18 @@ Those without a Linux environment may want to adapt the 'setup.sh' script.
 7. Run `python lp_analytics.py` (Module 4 — LP fee income, IL, net P&L figures)
 8. Run `python hyperliquid_fetch.py` (Module 5 — Hyperliquid perp prices & funding rates)
 9. Run `python hedge_backtest.py` (Module 5 — delta-hedging backtest & figures)
+
+`data_extraction.py` is the authoritative Module 1 extraction script. It connects to
+the configured Ethereum archive RPC endpoint and uses direct `eth_getLogs`,
+`eth_getBlockByNumber`, and historical `eth_call` requests to reproduce the
+on-chain parquet files. The `cache/` directory is only an optional raw-RPC cache
+for interrupted or repeated runs; the script writes the final parquet outputs from
+the extraction functions, not from prebuilt parquet inputs.
+
+The written report is in `latex/report.pdf`; its source is `latex/report.tex`.
+Generated parquet files are ignored by git via `*.parquet`, so include the
+`output/` parquet files explicitly when preparing a zip submission or force-add
+them if submitting through git.
 
 # Data Dictionary
 
@@ -102,7 +114,7 @@ One row per daily snapshot. The pool's price and tick state obtained via a direc
 
 ## 5. `collect_events.parquet`
 
-One row per Collect event from pool deployment through the end of the study window. Collected during the same extraction pass as mint/burn events. Required for Module 4 (Liquidity Provision Analytics).
+Auxiliary file with one row per Collect event from pool deployment through the end of the study window. The project brief's Output 2 note asks for Collect events to be downloaded during the same pass as Mint/Burn events for Module 4, but the required Module 1 deliverables list only four parquet files. In this repository, `collect_events.parquet` is kept for auditability; the synthetic-position fee calculation in `lp_analytics.py` uses swap-level fee accrual from `swap_events.parquet`, not real Collect withdrawals.
 
 | Column | Type | Unit | Description |
 |--------|------|------|-------------|
@@ -170,28 +182,33 @@ Impermanent loss uses the Uniswap V3 virtual reserve formulas (with the three ca
 
 ## 8. `perp_prices.parquet`
 
-Hourly OHLCV for the Hyperliquid ETH perpetual (Module 5). The `close` column is the mark price for hedge P&L. Rows with `price_source = uniswap_slot0_bridge` fill gaps where the Hyperliquid API returns no candles (early in the study window).
+Hourly OHLCV for the ETH perpetual (Module 5). The `close` column is the mark price used in all subsequent hedge P&L calculations.
+
+Source provenance. The Hyperliquid `candleSnapshot` endpoint retains 1h ETH candles only for roughly the most recent seven months, so the earliest hours of the study window cannot be retrieved at 1h resolution. Per Prof. Karyampas's directive (May 2026) we keep Hyperliquid as the sole data source and fill the missing hours by forward-filling Hyperliquid 4h candles (which retain longer and cover the full window) onto the hourly grid: for each hour H without a native 1h candle, the row inherits OHLCV from the most recent 4h candle whose timestamp ≤ H. In the current dataset the split is 602 `hyperliquid_4h_upsampled` rows (2025-10-01 00:00 UTC → 2025-10-26 01:00 UTC) followed by 3,766 `hyperliquid_1h` rows (2025-10-26 02:00 UTC → 2026-03-31 23:00 UTC), for 4,368 total hours. For upsampled rows the four hourly slots in each 4h bin share identical OHLCV (the bar's aggregate); only `close` is used downstream as the hedge mark price, so `volume` and `n_trades` should not be summed across upsampled rows without de-duplicating. `hyperliquid_fetch.py:build_hourly_prices` raises `RuntimeError` if any hour is not covered by either 1h or 4h Hyperliquid data — there is no other source.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `timestamp` | datetime64[UTC] | Hour start (UTC) |
 | `open`, `high`, `low`, `close` | float64 | USD prices |
-| `volume` | float64 | Perp volume (NaN for bridged rows) |
-| `price_source` | string | `hyperliquid` or `uniswap_slot0_bridge` |
+| `volume` | float64 | Perp volume (aggregated 4h value on upsampled rows; see provenance note above) |
+| `n_trades` | float64 | Trades in the hour (aggregated 4h value on upsampled rows) |
+| `price_source` | string | `hyperliquid_1h` (native) or `hyperliquid_4h_upsampled` (forward-filled from the 4h bar) |
 
 ---
 
 ## 9. `funding_rates.parquet`
 
-Hourly funding rates for the Hyperliquid ETH perpetual (Module 5).
+Hourly funding rates for the Hyperliquid ETH perpetual (Module 5). Funding records come exclusively from the Hyperliquid `fundingHistory` endpoint, which retains the full study window. `build_hourly_funding` raises `RuntimeError` if any hour is missing a record.
+
+Oracle-price proxy. The PDF funding formula references `oracle_price`. Hyperliquid's public API does not expose a historical oracle-price series — `candleSnapshot` returns mark prices and `fundingHistory` returns funding rate + premium, but no oracle history. We therefore store the hourly Hyperliquid candle close (1h native where available, 4h upsampled otherwise — see Section 8) as `oracle_price_proxy`. Per Hyperliquid's [funding docs](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding), the true oracle is a stake-weighted median of validator-submitted CEX spot prices, and the `premium` field captures the *impact*-price-vs-oracle spread (impact price = order-book-impact at a fixed notional, not the candle close). Mark and impact share the same order-book drivers, so `|premium|` (sample mean 4 bps, p99 7 bps, max 36 bps) is a reasonable empirical *sensitivity estimate* — not a strict bound — for the mark–oracle gap. Module 5 §5.2 ("Oracle-price proxy and sensitivity estimate") works through the induced funding-P&L error: of order ~0.36% of cumulative funding P&L worst case, ~0.04% on average — a few dollars per position over the holding window, immaterial to strategy ranking.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `timestamp` | datetime64[UTC] | Hour (UTC) |
 | `funding_rate` | float64 | Hourly funding rate (longs pay shorts when > 0) |
-| `premium` | float64 | Premium component from API |
+| `premium` | float64 | Hyperliquid premium component from `fundingHistory` (impact-vs-oracle, not mark-vs-oracle) |
 | `coin` | string | `ETH` |
-| `oracle_price` | float64 | Mark price from `perp_prices.close` at the same hour |
+| `oracle_price_proxy` | float64 | USD. Hourly candle close from `perp_prices.parquet`, used as a proxy for the unavailable historical oracle (see above). |
 
 ---
 
@@ -206,6 +223,7 @@ Hourly delta-hedging backtest output for 15 strategy variants (5 LP positions ×
 | `rebalance_hours` | int64 | 1, 4, or 24 |
 | `timestamp` | datetime64[UTC] | Hour (UTC) |
 | `eth_price` | float64 | Mark price (USD) |
+| `price_source` | string | Provenance of `eth_price` for the hour, copied from `perp_prices.parquet`: `hyperliquid_1h` (native) or `hyperliquid_4h_upsampled` (4h-derived; see Section 8) |
 | `v_lp_usd`, `v_hodl_usd` | float64 | LP and HODL values at the hour |
 | `gross_il_usd` | float64 | `v_hodl_usd − v_lp_usd` |
 | `lp_delta_eth` | float64 | \|∂V_LP/∂p\| at the hour |

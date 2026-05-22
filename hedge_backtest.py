@@ -16,7 +16,11 @@ Outputs:
 
 Strategy: short |Δ_LP| ETH on Hyperliquid; rebalance every 1h / 4h / 24h.
 Trading fee: 0.045% on notional at each rebalance (|Δq| * price).
-Funding: funding_pnl = |Δ_LP| * oracle_price * funding_rate  (short receives if rate > 0).
+Funding: funding_pnl = |Δ_LP| * oracle_price_proxy * funding_rate
+  (short receives if rate > 0). `oracle_price_proxy` is the hourly candle
+  close from perp_prices.parquet, used as a proxy because Hyperliquid's
+  public API does not expose a historical oracle series; see
+  hyperliquid_fetch.py module docstring.
 """
 
 from __future__ import annotations
@@ -127,26 +131,41 @@ def lp_gamma_eth(L, sqrt_pa, sqrt_pb, p_usdc_per_weth, eps: float = 1e-4) -> flo
 def plot_payoff_and_delta(positions: pd.DataFrame, entry_price: float) -> None:
     p_grid = np.linspace(0.5 * entry_price, 1.5 * entry_price, 300)
 
-    fig, ax = plt.subplots(figsize=(11, 6))
+    fig, axes = plt.subplots(2, 1, figsize=(11, 10), sharex=True)
+    ax_lp, ax_il = axes
     for _, row in positions.iterrows():
         pid = row["position_id"]
         L = float(row["L"])
         sa = sqrt_price_at_tick(int(row["tick_lower"]))
         sb = sqrt_price_at_tick(int(row["tick_upper"]))
         x0, y0 = row["x0_weth"], row["y0_usdc"]
+        v_lp_curve = []
+        v_hodl_curve = []
         il_curve = []
         for p in p_grid:
             v_lp = v_lp_usd(L, sa, sb, p)
             v_hodl = x0 * p + y0
+            v_lp_curve.append(v_lp)
+            v_hodl_curve.append(v_hodl)
             il_curve.append(v_hodl - v_lp)
-        ax.plot(p_grid, il_curve, color=COLORS[pid], lw=2, label=f"{pid}")
-    ax.axvline(entry_price, color="k", ls="--", lw=0.8, alpha=0.5)
-    ax.axhline(0, color="k", lw=0.6)
-    ax.set_xlabel("Terminal ETH price (USDC per WETH)")
-    ax.set_ylabel("Impermanent loss at terminal price  IL = V_HODL − V_LP  (USD)")
-    ax.set_title("LP Payoff Shape (no fees): IL vs terminal ETH price")
-    ax.legend(fontsize=9)
-    ax.grid(True, ls=":", alpha=0.4)
+        ax_lp.plot(p_grid, v_lp_curve, color=COLORS[pid], lw=2, label=f"{pid}  $V_{{LP}}$")
+        ax_lp.plot(p_grid, v_hodl_curve, color=COLORS[pid], lw=1, ls="--", alpha=0.45)
+        ax_il.plot(p_grid, il_curve, color=COLORS[pid], lw=2, label=f"{pid}")
+
+    ax_lp.axvline(entry_price, color="k", ls="--", lw=0.8, alpha=0.5)
+    ax_lp.set_ylabel("Position value at terminal price (USD)")
+    ax_lp.set_title("Task 5.1.1 — LP Payoff $V_{LP}(P_T)$ (solid) vs HODL benchmark (dashed), ignoring fees")
+    ax_lp.legend(fontsize=8, ncol=2)
+    ax_lp.grid(True, ls=":", alpha=0.4)
+
+    ax_il.axvline(entry_price, color="k", ls="--", lw=0.8, alpha=0.5)
+    ax_il.axhline(0, color="k", lw=0.6)
+    ax_il.set_xlabel("Terminal ETH price (USDC per WETH)")
+    ax_il.set_ylabel("IL = $V_{HODL} - V_{LP}$  (USD)")
+    ax_il.set_title("Impermanent loss profile — short-gamma footprint relative to HODL")
+    ax_il.legend(fontsize=9)
+    ax_il.grid(True, ls=":", alpha=0.4)
+
     fig.tight_layout()
     fig.savefig(FIG_PAYOFF, dpi=130)
     plt.close(fig)
@@ -184,7 +203,9 @@ def run_backtest(
 ) -> pd.DataFrame:
     """15 variants: 5 positions × rebalance {1h, 4h, 24h}."""
     prices = prices.sort_values("timestamp").reset_index(drop=True)
-    funding = funding.set_index("timestamp").sort_index()["funding_rate"]
+    funding = funding.set_index("timestamp").sort_index()
+    fr_series = funding["funding_rate"]
+    op_series = funding["oracle_price_proxy"]
     records = []
 
     for _, pos in positions.iterrows():
@@ -204,7 +225,8 @@ def run_backtest(
             for i, row in prices.iterrows():
                 t = row["timestamp"]
                 p = float(row["close"])
-                fund_rate = float(funding.get(t, 0.0))
+                fund_rate = float(fr_series.loc[t])
+                oracle_price = float(op_series.loc[t])
 
                 delta = abs(lp_delta_eth(L, sa, sb, p))
                 v_lp = v_lp_usd(L, sa, sb, p)
@@ -213,12 +235,11 @@ def run_backtest(
 
                 if p_prev is not None:
                     cum_hedge += -q_short * (p - p_prev)
-                    cum_funding += q_short * p_prev * fund_rate
+                    cum_funding += q_short * oracle_price * fund_rate
 
                 if i == 0 or (i % reb_h == 0):
                     q_new = delta
-                    if i > 0:
-                        cum_trade_fee += abs(q_new - q_short) * p * TRADING_FEE
+                    cum_trade_fee += abs(q_new - q_short) * p * TRADING_FEE
                     q_short = q_new
 
                 net_hedge = cum_hedge + cum_funding - cum_trade_fee
@@ -234,6 +255,7 @@ def run_backtest(
                     "rebalance_hours": reb_h,
                     "timestamp": t,
                     "eth_price": p,
+                    "price_source": row["price_source"],
                     "v_lp_usd": v_lp,
                     "v_hodl_usd": v_hodl,
                     "gross_il_usd": gross_il,
@@ -314,11 +336,79 @@ def main() -> None:
     funding = pd.read_parquet(FUNDING_PATH)
     funding["timestamp"] = pd.to_datetime(funding["timestamp"], utc=True)
 
+    src_counts = prices["price_source"].value_counts().to_dict()
+    print(f"  price_source coverage: {src_counts}")
+
+    lp_entry = ts["snapshot_timestamp"].min()
+    lp_exit = ts["snapshot_timestamp"].max()
+    n_before = len(prices)
+    prices = prices[prices["timestamp"] <= lp_exit].reset_index(drop=True)
+    print(f"  Clipped to LP holding period (exit {lp_exit}): {len(prices):,} hourly rows (dropped {n_before - len(prices)})")
+
+    # Hourly grid completeness: exact boundaries, no duplicates, no gaps.
+    assert prices["timestamp"].is_monotonic_increasing, "prices timestamps not sorted"
+    assert not prices["timestamp"].duplicated().any(), "duplicate timestamps in prices"
+    assert prices["timestamp"].iloc[0] == lp_entry, (
+        f"prices start {prices['timestamp'].iloc[0]} != LP entry {lp_entry}"
+    )
+    assert prices["timestamp"].iloc[-1] == lp_exit, (
+        f"prices end {prices['timestamp'].iloc[-1]} != LP exit {lp_exit}"
+    )
+    expected_hours = pd.date_range(lp_entry, lp_exit, freq="1h")
+    assert len(prices) == len(expected_hours), (
+        f"hourly grid gap: expected {len(expected_hours)} hours, got {len(prices)}"
+    )
+
+    # Funding must cover every price timestamp exactly (no silent zero-fill).
+    funding_set = set(funding["timestamp"])
+    missing = [t for t in prices["timestamp"] if t not in funding_set]
+    assert not missing, (
+        f"funding missing {len(missing)} timestamps in [{lp_entry}, {lp_exit}]; "
+        f"first missing: {missing[0]}"
+    )
+
     daily_fees = ts[["position_id", "snapshot_timestamp", "cumulative_fee_usd"]].rename(
         columns={"snapshot_timestamp": "timestamp"}
     )
 
     results = run_backtest(positions, prices, funding, daily_fees)
+
+    # Output invariants.
+    expected_strategies = 5 * len(REBALANCE_HOURS)
+    assert results["strategy_id"].nunique() == expected_strategies, (
+        f"expected {expected_strategies} strategy_ids, got {results['strategy_id'].nunique()}"
+    )
+    per_strategy = results.groupby("strategy_id").size()
+    assert per_strategy.eq(len(prices)).all(), (
+        f"per-strategy row count not uniform: {per_strategy[per_strategy != len(prices)].to_dict()}"
+    )
+    pnl_cols = [
+        "v_lp_usd", "v_hodl_usd", "gross_il_usd", "lp_delta_eth",
+        "hedge_pnl_cum_usd", "funding_pnl_cum_usd", "trading_fees_cum_usd",
+        "net_hedge_pnl_usd", "residual_il_usd", "net_position_pnl_usd",
+    ]
+    nan_counts = results[pnl_cols].isna().sum()
+    assert (nan_counts == 0).all(), f"NaN in P&L columns: {nan_counts[nan_counts > 0].to_dict()}"
+
+    # Accounting identities (must hold at every row).
+    id_tol = 1e-9
+    err_net = (
+        results["net_hedge_pnl_usd"]
+        - (results["hedge_pnl_cum_usd"] + results["funding_pnl_cum_usd"]
+           - results["trading_fees_cum_usd"])
+    ).abs().max()
+    err_resid = (
+        results["residual_il_usd"]
+        - (results["gross_il_usd"] - results["net_hedge_pnl_usd"])
+    ).abs().max()
+    err_pos = (
+        results["net_position_pnl_usd"]
+        - (results["cumulative_fee_usd"] - results["residual_il_usd"])
+    ).abs().max()
+    assert err_net < id_tol, f"net_hedge identity violated (max |err|={err_net:.3e})"
+    assert err_resid < id_tol, f"residual_il identity violated (max |err|={err_resid:.3e})"
+    assert err_pos < id_tol, f"net_position_pnl identity violated (max |err|={err_pos:.3e})"
+
     results.to_parquet(HEDGE_OUT, index=False)
     print(f"  Wrote {HEDGE_OUT}  ({len(results):,} rows)")
 

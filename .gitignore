@@ -1,5 +1,9 @@
 .vscode/
 *.parquet
+cache/
+latex/*.aux
+latex/*.log
+latex/*.out
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

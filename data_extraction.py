@@ -3,11 +3,14 @@ data_extraction.py
 ==================
 Extracts all on-chain data required for the Uniswap V3 USDC/WETH (0.05%) pool analysis.
 
-Produces four Parquet files:
+Produces the four required Module 1 Parquet files, plus one auxiliary file:
     - swap_events.parquet
     - mint_burn_events.parquet
     - liquidity_snapshots.parquet
     - slot0_snapshots.parquet
+    - collect_events.parquet (auxiliary: downloaded during the mint/burn scan
+      because the project brief's Output 2 note asks for Collect events for
+      Module 4; the synthetic LP fee calculation in lp_analytics.py uses swaps)
 
 Usage:
     conda activate uniswap_project
@@ -73,8 +76,12 @@ RETRY_BACKOFF       = 2.0                 # seconds; doubles on each failure
 # Output file paths
 OUT_SWAP            = "output/swap_events.parquet"
 OUT_MINT_BURN       = "output/mint_burn_events.parquet"
+OUT_COLLECT         = "output/collect_events.parquet"
 OUT_LIQ_SNAP        = "output/liquidity_snapshots.parquet"
 OUT_SLOT0_SNAP      = "output/slot0_snapshots.parquet"
+
+os.makedirs("output", exist_ok=True)
+os.makedirs("cache", exist_ok=True)
 
 # =============================================================================
 # ABI — Minimal ABI covering only the events and functions we need.
@@ -576,23 +583,10 @@ def get_logs_multi_cached(events: dict, from_block: int, to_block: int) -> dict:
     # Check for existing progress file (interrupted run)
     if os.path.exists(progress_file):
         print(f"  Found interrupted session! Resuming from progress file...")
-        # Load progress and continue
-        with open(progress_file, "rb") as f:
-            progress_data = pickle.load(f)
-            results = progress_data["results"]
-            for name, logs in results.items():
-                print(f"  Already fetched {len(logs):,} {name} events before interruption")
-        
-        # Continue fetching remaining chunks
-        print(f"  Resuming from block {progress_data['last_chunk_start'] + 1}...")
-        
-        # Calculate remaining chunks
-        remaining_results = get_logs_chunked_multi(events, from_block, to_block)
-        
-        # Merge results (should append to existing)
-        for name in events:
-            if name in remaining_results:
-                results[name].extend(remaining_results[name])
+        # get_logs_chunked_multi loads the progress file itself, skips processed
+        # chunks, and returns the full in-memory result. Do not merge it with
+        # the progress payload here, or already processed chunks are doubled.
+        results = get_logs_chunked_multi(events, from_block, to_block)
         
         # Save final cache
         with open(cache_file, "wb") as f:
@@ -771,8 +765,10 @@ def extract_mint_burn_events() -> pd.DataFrame:
     the liquidity map at the start of our window is the cumulative result of
     ALL prior LP actions since deployment.
 
-    We also collect Collect events in this same pass (needed for Module 4)
-    to avoid a second full historical scan.
+    We also collect Collect events in this same pass because the project brief's
+    Output 2 note asks for them for Module 4, and this avoids a second full
+    historical scan. The main synthetic-position fee calculation later uses
+    swap-level fee accrual rather than real Collect withdrawals.
     """
     print("\n=== Output 2: mint_burn_events ===")
     print(f"  Scanning from deployment block {POOL_DEPLOY_BLOCK:,} to {STUDY_END_BLOCK:,}")
@@ -793,7 +789,7 @@ def extract_mint_burn_events() -> pd.DataFrame:
     burn_logs    = all_logs["Burn"]
     collect_logs = all_logs["Collect"]
 
-    # --- Save Collect events for Module 4 ---
+    # --- Save auxiliary Collect events requested by the project brief ---
     collect_rows = []
     for log in collect_logs:
         args = log["args"]
@@ -811,8 +807,20 @@ def extract_mint_burn_events() -> pd.DataFrame:
         })
     if collect_rows:
         collect_df = pd.DataFrame(collect_rows)
-        collect_df.to_parquet("collect_events.parquet", index=False)
-        print(f"  Saved {len(collect_df):,} Collect rows → collect_events.parquet")
+        before = len(collect_df)
+        collect_df = collect_df.drop_duplicates(subset=[
+            "transaction_hash",
+            "owner",
+            "recipient",
+            "tick_lower",
+            "tick_upper",
+            "amount0_raw",
+            "amount1_raw",
+        ]).sort_values("block_number").reset_index(drop=True)
+        if before != len(collect_df):
+            print(f"  Removed {before - len(collect_df):,} duplicate Collect rows")
+        collect_df.to_parquet(OUT_COLLECT, index=False)
+        print(f"  Saved {len(collect_df):,} Collect rows → {OUT_COLLECT}")
 
     # --- Build mint/burn DataFrame ---
     all_block_nums = (
@@ -857,6 +865,18 @@ def extract_mint_burn_events() -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows)
+    before = len(df)
+    df = df.drop_duplicates(subset=[
+        "transaction_hash",
+        "event_type",
+        "tick_lower",
+        "tick_upper",
+        "liquidity_raw",
+        "amount0_raw",
+        "amount1_raw",
+    ])
+    if before != len(df):
+        print(f"  Removed {before - len(df):,} duplicate Mint/Burn rows")
     df = df.sort_values("block_number").reset_index(drop=True)
     df.to_parquet(OUT_MINT_BURN, index=False)
     print(f"  Saved {len(df):,} rows → {OUT_MINT_BURN}")
@@ -1095,31 +1115,14 @@ def main():
     print(f"Study window: blocks {STUDY_START_BLOCK:,} → {STUDY_END_BLOCK:,}")
     print("=" * 60)
 
-    # Run extractions in dependency order
-    #slot0_df    = extract_slot0_snapshots()     # Output 4 (needed by Output 3)
-    slot0_df    = pd.read_parquet(OUT_SLOT0_SNAP) 
-    #swap_df     = extract_swap_events()          # Output 1
-    swap_df     = pd.read_parquet(OUT_SWAP)
-    #mb_df       = extract_mint_burn_events()     # Output 2
-    mb_df       = pd.read_parquet(OUT_MINT_BURN)
-    
-    # The above data frame contains duplicates, we must remove them
-    before = len(mb_df)
-    mb_df = mb_df.drop_duplicates(subset=[
-        "transaction_hash",
-        "event_type", 
-        "tick_lower",
-        "tick_upper",
-        "liquidity_raw",    # same tx can have same ticks but different amounts
-        "amount0_raw",      # include token amounts to be safe
-        "amount1_raw",
-    ])
-    after = len(mb_df)
-    print(f"Removed {before - after:,} duplicates ({before:,} → {after:,} rows)")
-    mb_df = mb_df.sort_values("block_number").reset_index(drop=True)
-    
+    # Run extractions in dependency order. These functions make direct RPC calls
+    # (`eth_getLogs`, `eth_getBlockByNumber`, and historical `eth_call`) and
+    # write the final parquet outputs. The cache directory stores raw RPC
+    # responses only to make interrupted or repeated extraction runs cheaper.
+    slot0_df    = extract_slot0_snapshots()      # Output 4 (needed by Output 3)
+    swap_df     = extract_swap_events()          # Output 1
+    mb_df       = extract_mint_burn_events()     # Output 2 + Collect events
     snap_df     = extract_liquidity_snapshots(mb_df, slot0_df)  # Output 3
-    #snap_df     = pd.read_parquet(OUT_LIQ_SNAP)
 
     
     # Run validations
@@ -1127,7 +1130,7 @@ def main():
     validate_swap_volume(swap_df)
     validate_slot0_vs_swaps(slot0_df, swap_df)
 
-    print("\n✓ All done. Four Parquet files written to current directory.")
+    print("\n✓ All done. Parquet files written to output/.")
 
 
 if __name__ == "__main__":

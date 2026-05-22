@@ -285,6 +285,12 @@ print(f"\n  Wrote {POSITIONS_OUT}  ({len(positions_df)} rows)")
 # ---------------------------------------------------------------------------
 # 4.  TASK 4.2 - FEE INCOME (VECTORISED)
 # ---------------------------------------------------------------------------
+# Note on collect_events.parquet: the file is extracted in Module 1 (per the
+# PDF's instruction to download Collect events alongside Mint/Burn) but is
+# NOT used here. Per Task 4.2, fees are reconstructed from swap_events.parquet
+# via per-swap liquidity-share allocation (share = L_p / swap.liquidity).
+# Collect events are real on-chain LP withdrawals; the synthetic P1-P5
+# positions do not exist on-chain, so no Collect events refer to them.
 
 print("\nTask 4.2 - pre-computing per-swap fee components ...")
 swaps["liquidity_f"] = swaps["liquidity"].astype(float)
