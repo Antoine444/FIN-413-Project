@@ -282,7 +282,7 @@ def plot_funding(funding: pd.DataFrame, prices: pd.DataFrame, out_path: str) -> 
     ax1.grid(True, ls=":", alpha=0.4)
     lines1, lab1 = ax1.get_legend_handles_labels()
     lines2, lab2 = ax1b.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, lab1 + lab2, loc="upper left", fontsize=8)
+    ax1.legend(lines1 + lines2, lab1 + lab2, loc="lower right", fontsize=8)
     for ax in axes:
         ax.xaxis.set_major_locator(mdates.MonthLocator())
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
