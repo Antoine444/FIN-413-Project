@@ -225,8 +225,11 @@ for block in snap_blocks:
     for k in ILR_BANDS:
         lo = price_usdc * (1 - k)
         hi = price_usdc * (1 + k)
-        # ticks whose mid-price falls in [lo, hi]
-        mask = (snap_liq["price_lower"] >= lo) & (snap_liq["price_upper"] <= hi)
+        # Strict containment: the tick interval [price_upper, price_lower] (low → high
+        # in USDC/WETH; remember USDC=token0 so a higher V3 tick gives a LOWER
+        # USDC/WETH value, hence price_upper < price_lower numerically) is entirely
+        # inside [lo, hi]. This matches the report formula in §2.3.
+        mask = (snap_liq["price_upper"] >= lo) & (snap_liq["price_lower"] <= hi)
         band_liq = snap_liq.loc[mask, "active_liquidity"].astype(float).sum()
         ilr[k] = band_liq / total_liq if total_liq > 0 else 0.0
 
@@ -241,7 +244,9 @@ for block in snap_blocks:
     # regardless of how many tick rows it spans.
     lo_hhi = price_usdc * 0.60
     hi_hhi = price_usdc * 1.40
-    hhi_mask = (snap_liq["price_lower"] >= lo_hhi) & (snap_liq["price_upper"] <= hi_hhi)
+    # Same strict-containment convention as the ILR mask above
+    # (price_upper < price_lower numerically because USDC=token0).
+    hhi_mask = (snap_liq["price_upper"] >= lo_hhi) & (snap_liq["price_lower"] <= hi_hhi)
     hhi_sub = snap_liq.loc[hhi_mask].copy()
 
     BUCKET_TICKS = 100 * TICK_SPACING   # 1000 ticks per bucket
@@ -355,49 +360,61 @@ print(f"  Saved → {fig21_path}")
 
 print("Generating Fig 2.1 tiled time-series …")
 
-n_snaps   = len(metrics_df)
-ncols     = min(6, n_snaps)
-nrows     = int(np.ceil(n_snaps / ncols))
+# Split the 182-day window into two chunks (Oct–Dec and Jan–Mar) and emit one
+# landscape PNG per chunk. This keeps each tile large enough to read while
+# preserving "all snapshots" coverage required by Task 2.1.
+split_ts   = pd.Timestamp("2026-01-01", tz="UTC")
+chunks     = [
+    ("Oct–Dec 2025", metrics_df[metrics_df["snapshot_timestamp"] <  split_ts]),
+    ("Jan–Mar 2026", metrics_df[metrics_df["snapshot_timestamp"] >= split_ts]),
+]
 
-fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows))
-axes = np.array(axes).flatten()
+for chunk_idx, (chunk_label, chunk_df) in enumerate(chunks, start=1):
+    chunk_df = chunk_df.reset_index(drop=True)
+    n_snaps  = len(chunk_df)
+    # 12-wide grid keeps tiles square-ish (8.4" × 8.4" landscape-page area / 12 ≈ 0.7" tile)
+    ncols    = 12
+    nrows    = int(np.ceil(n_snaps / ncols))
 
-fig.suptitle(
-    "Fig 2.1b — Liquidity Profile Evolution (Daily Snapshots)\n"
-    "Uniswap V3 USDC/WETH 0.05 % Pool",
-    fontsize=14, fontweight="bold"
-)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(2.2 * ncols, 1.9 * nrows))
+    axes = np.array(axes).flatten()
 
-for i, row in metrics_df.iterrows():
-    ax    = axes[i]
-    block = int(row["snapshot_block"])
-    cur_price = row["price_usdc_per_weth"]
+    fig.suptitle(
+        f"Fig 2.1b ({chunk_idx}/2) — Liquidity Profile Evolution: {chunk_label}\n"
+        "Uniswap V3 USDC/WETH 0.05 % Pool",
+        fontsize=14, fontweight="bold"
+    )
 
-    snap_liq = liq_df[liq_df["snapshot_block"] == block].copy()
-    lo_price  = cur_price * 0.85
-    hi_price  = cur_price * 1.15
-    snap_liq  = snap_liq[(snap_liq["price_lower"] >= lo_price) & (snap_liq["price_upper"] <= hi_price)]
+    for i, row in chunk_df.iterrows():
+        ax    = axes[i]
+        block = int(row["snapshot_block"])
+        cur_price = row["price_usdc_per_weth"]
 
-    prices = 0.5 * (snap_liq["price_lower"] + snap_liq["price_upper"])
-    liqs   = snap_liq["active_liquidity"].astype(float)
+        snap_liq = liq_df[liq_df["snapshot_block"] == block].copy()
+        lo_price  = cur_price * 0.85
+        hi_price  = cur_price * 1.15
+        snap_liq  = snap_liq[(snap_liq["price_lower"] >= lo_price) & (snap_liq["price_upper"] <= hi_price)]
 
-    ax.bar(prices, liqs,
-           width=(snap_liq["price_upper"] - snap_liq["price_lower"]),
-           color="steelblue", alpha=0.7, linewidth=0)
-    ax.axvline(cur_price, color="crimson", linewidth=1.0, linestyle="--")
-    ax.set_title(row["snapshot_timestamp"].strftime("%b %d"), fontsize=7)
-    ax.yaxis.set_visible(False)
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x/1000:.0f}k"))
-    ax.tick_params(axis="x", labelsize=6, rotation=45)
+        prices = 0.5 * (snap_liq["price_lower"] + snap_liq["price_upper"])
+        liqs   = snap_liq["active_liquidity"].astype(float)
 
-for j in range(i + 1, len(axes)):
-    axes[j].set_visible(False)
+        ax.bar(prices, liqs,
+               width=(snap_liq["price_upper"] - snap_liq["price_lower"]),
+               color="steelblue", alpha=0.7, linewidth=0)
+        ax.axvline(cur_price, color="crimson", linewidth=1.0, linestyle="--")
+        ax.set_title(row["snapshot_timestamp"].strftime("%b %d"), fontsize=8)
+        ax.yaxis.set_visible(False)
+        ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x/1000:.0f}k"))
+        ax.tick_params(axis="x", labelsize=7, rotation=45)
 
-plt.tight_layout()
-fig21b_path = os.path.join(OUTPUT_DIR, "fig2_1b_liquidity_profile_tiled.png")
-plt.savefig(fig21b_path, dpi=120, bbox_inches="tight")
-plt.close()
-print(f"  Saved → {fig21b_path}")
+    for j in range(n_snaps, len(axes)):
+        axes[j].set_visible(False)
+
+    plt.tight_layout()
+    fig21b_path = os.path.join(OUTPUT_DIR, f"fig2_1b_liquidity_profile_tiled_p{chunk_idx}.png")
+    plt.savefig(fig21b_path, dpi=130, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved → {fig21b_path}")
 
 # ---------------------------------------------------------------------------
 # 7.  FIGURE 2.2 — TVL DECOMPOSITION (stacked area chart)

@@ -85,8 +85,8 @@ One row per initialised tick per daily snapshot. Snapshots are taken at the bloc
 
 | Column | Type | Unit | Description |
 |--------|------|------|-------------|
-| `snapshot_block` | int64 | block | Block number of the daily snapshot (closest block to 00:00 UTC) |
-| `snapshot_timestamp` | datetime64[UTC] | UTC datetime | Timestamp of the snapshot block |
+| `snapshot_block` | int64 | block | Block number of the daily snapshot (first block at or after 00:00 UTC each day) |
+| `snapshot_timestamp` | datetime64[UTC] | UTC datetime | Target 00:00 UTC of the snapshot day. The row's `snapshot_block` is the first Ethereum block at or after this instant; we store the target time (not the actual block timestamp) so the daily grid is exactly aligned. |
 | `tick` | int32 | tick index | Tick index of an initialised tick boundary (only ticks with liquidityGross > 0 are included) |
 | `liquidity_net` | string | liquidity units | Net liquidity change at this tick: positive at a position's lower boundary, negative at its upper boundary. Used to compute active liquidity by walking from MIN_TICK upward (int64); stored as string to avoid overflow |
 | `liquidity_gross` | string | liquidity units | Total absolute liquidity referencing this tick across all positions. A tick is initialised (active) when this value is greater than zero (int64); stored as string to avoid overflow |
@@ -102,8 +102,8 @@ One row per daily snapshot. The pool's price and tick state obtained via a direc
 
 | Column | Type | Unit | Description |
 |--------|------|------|-------------|
-| `snapshot_block` | int64 | block | Block number at which slot0() was called (closest block to 00:00 UTC each day) |
-| `snapshot_timestamp` | datetime64[UTC] | UTC datetime | Timestamp of the snapshot block |
+| `snapshot_block` | int64 | block | Block number at which slot0() was called (first block at or after 00:00 UTC each day) |
+| `snapshot_timestamp` | datetime64[UTC] | UTC datetime | Target 00:00 UTC of the snapshot day, same convention as `liquidity_snapshots.parquet`. |
 | `sqrtPriceX96` | string | raw | Square root of the pool price encoded as sqrt(price) × 2^96; stored as string to avoid uint160 overflow |
 | `price_usdc_per_weth` | float64 | USDC/WETH | Human-readable price derived from sqrtPriceX96, decimal-adjusted for USDC (6 decimals) and WETH (18 decimals) |
 | `current_tick` | int32 | tick index | The active tick at the snapshot block, i.e. the tick whose range contains the current price |
